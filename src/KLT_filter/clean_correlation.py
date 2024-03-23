@@ -1,8 +1,9 @@
 import sys
 import numpy as np
 from glob import glob
-
-from rfi_shion_version import clean_persistent_rfi
+import copy
+from KLT_filter.rfi_shion_version_old import clean_persistent_rfi as clean_persistent_rfi_old
+from KLT_filter.injections.rfi_shion_version import clean_persistent_rfi
 from typing import Optional
 import logging
 import baseband_analysis.core.calibration as cal
@@ -68,7 +69,7 @@ def clean_and_form_singlebeams(
         backend.static_delays=True
 
     datafiles_all=glob(raw_data_dir)
-
+    out_files=[]
     for i in range(len(ras)):
         source_type=source_types[i]
         source_name=src_names[i]
@@ -98,13 +99,40 @@ def clean_and_form_singlebeams(
             gains = cal.read_gains(cal_h5)
             cal.apply_calibration(data, gains, inputs=inputs)
 
-            if clean:
+            if True: #clean:
                 clean_persistent_rfi(
-                    data=data, ra=np.array([ra]), dec=np.array([dec]), ps_gain_file=cal_h5,inputs=inputs,
-                    reference_feed=reference_feed,static_delays=backend.static_delays,
+                    data=data, 
+                    ra=np.array([ra]),
+                        dec=np.array([dec]), 
+                    source_names=np.array([source_name]),
+                        ps_gain_file=cal_h5,
+                        inputs=inputs,
+                    reference_feed=reference_feed,
+                    static_delays=backend.static_delays,
+                    obs=backend.obs,
+                    clean=clean)
+                '''clean_persistent_rfi_old(
+                    data=data, 
+                    ra=np.array([ra]),
+                     dec=np.array([dec]), 
+                     ps_gain_file=cal_h5,
+                     inputs=inputs,
+                    reference_feed=reference_feed,
+                    static_delays=backend.static_delays,
                     obs=backend.obs)
+                beamform.tied_array(
+                    data,
+                    ra=np.array([ra]),
+                    dec=np.array([dec]),
+                    source_name=np.array([source_name]),
+                    correlator_inputs=inputs,
+                    obs=backend.obs,
+                    reference_feed=reference_feed,
+                    static_delays=backend.static_delays,#telescope_rotation=telescope_rot
+                )'''
 
-            beamform.tied_array(
+            else:
+                beamform.tied_array(
                     data,
                     ra=np.array([ra]),
                     dec=np.array([dec]),
@@ -114,11 +142,12 @@ def clean_and_form_singlebeams(
                     reference_feed=reference_feed,
                     static_delays=backend.static_delays,#telescope_rotation=telescope_rot
                 )
-
-            del data["baseband"]
+                del data["baseband"]
             datas.append(data)
         beamformed_rfi_cleaned = bbdata.concatenate(datas)
 
         beamformed_rfi_cleaned.save(out_file)
         logging.info(f"saving to {out_file}")
         beamformed_rfi_cleaned.close()
+        out_files.append(out_file)
+    return out_files

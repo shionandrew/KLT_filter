@@ -46,7 +46,7 @@ from outriggers_vlbi_pipeline.vlbi_pipeline_config import calibrator_catalogue, 
 from outriggers_vlbi_pipeline.cross_correlate_data import re_correlate_target
 
 from outriggers_vlbi_pipeline.calibration import get_calibrator_visibilities, make_calibrated_visibilities
-from clean_correlation import clean_and_form_singlebeams
+from KLT_filter.clean_correlation import clean_and_form_singlebeams
 
 database=kko_events_database
 version=current_version
@@ -84,12 +84,18 @@ def run_baseband_localization_pipeline(eid):
         
 if __name__=='__main__': 
     parser = argparse.ArgumentParser("Localisation Pipeline Executable")
-    parser.add_argument("--event_id", help="event id", type=int)
+    parser.add_argument("--event_id", help="event id", type=int,default=0)
+    parser.add_argument("--nstart", help="nstart", type=int,default=0)
+    parser.add_argument("--nstop", help="nstop", type=int,default=0)
     parser.add_argument("--clean", help="apply rfi filter, True or False", type=str)
     parser.add_argument("--off_pointing", help="point to true position or bb position, True or False", type=str)
+    parser.add_argument("--interpolate", help="use interpolated gains, True or False", type=str,default='False')
     cmdargs = parser.parse_args()
     clean=cmdargs.clean
+    interpolate=cmdargs.interpolate
     event_id=cmdargs.event_id
+    nstart=cmdargs.nstart
+    nstop=cmdargs.nstop
     off_pointing=cmdargs.off_pointing
 
     if clean=='True':
@@ -98,6 +104,13 @@ if __name__=='__main__':
         clean=False
     else:
         raise AssertionError("use True or False as inputs to --clean") 
+    
+    if interpolate=='True':
+        interpolate=True
+    elif interpolate=='False':
+        interpolate=False
+    else:
+        raise AssertionError("use True or False as inputs to --interpolate") 
     
     if off_pointing=='True':
         off_pointing=True
@@ -116,17 +129,31 @@ if __name__=='__main__':
 
     database=kko_events_database
 
-    df_pulsars_loc=pd.read_csv('/arc/home/shiona/old_plot_data/pulsar_localization_results.csv')
+    df_pulsars_loc=pd.read_csv('/arc/home/shiona/archive/old_plot_data/pulsar_localization_results.csv')
     df_pulsars_loc=df_pulsars_loc.sort_values(by='errors',ascending=False).reset_index(drop=True)
     df_cal=get_calibrator_dataframe()
     
-    events=[event_id]#307063854,306336576,304499017,268914678]
+    if event_id==0:
+        events=np.array(df_pulsars_loc['event_id'])[nstart:nstop]
+    else:
+        events=[event_id]#307063854,306336576,304499017,268914678]
                     # 307063854= B0136+57, 74.0004882812
        
+    print(f"WILL PROCESS EVENTS {events}")
+
+    log_folder='/arc/home/shiona/'
+    log_file_event = os.path.join(log_folder, f'{nstart}_to_{nstop}_{events[0]}_to_{events[-1]}_{tag}_beamform_and_correlate.log')
+    
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+        handlers=[logging.FileHandler(log_file_event),  # Output log messages to a log file specific to this event
+        logging.StreamHandler()],  # Output log messages to the console
+        force=True
+    )
+    logging.info(f"writing to {log_file_event}")
 
     for event_id in events:
-        df_pulsars_locx=df_pulsars_loc[df_pulsars_loc['event_id']==event_id].reset_index(drop=True)
-        cal_name=df_pulsars_locx['cal_name'][0]
         event = get_event_data(event_id,events_database=database)
         DM=event['DM'][0]
         src_name = event["source_name"][0]
@@ -134,7 +161,12 @@ if __name__=='__main__':
         month = int(event["month"][0])
         day = int(event["day"][0])
         ctime=float(event['ctime'][0])
-
+        try:
+            df_pulsars_locx=df_pulsars_loc[df_pulsars_loc['event_id']==event_id].reset_index(drop=True)
+            cal_name=df_pulsars_locx['cal_name'][0]
+        except:
+            df_pulsars_locx=df_pulsars_loc[df_pulsars_loc['target']==src_name].reset_index(drop=True)
+            cal_name=df_pulsars_locx['cal_name'][0]
         if off_pointing:
             logging.info("Using BB position")
             tag+='_bb_pointing'
@@ -159,19 +191,8 @@ if __name__=='__main__':
         src_names=np.array(src_names)
         ras=np.array(ras)
         decs=np.array(decs)
-
-        log_folder=get_full_filepath(event_id=event_id,data_type='logs',events_database=database)
-        os.makedirs(log_folder, exist_ok=True)
-        log_file_event = os.path.join(log_folder, f'{event_id}_beamform_and_correlate.log')
-        logging.basicConfig(
-            level=logging.INFO, 
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-            handlers=[logging.FileHandler(log_file_event),  # Output log messages to a log file specific to this event
-            logging.StreamHandler()],  # Output log messages to the console
-            force=True
-        )
-        logging.info(f"writing to {log_file_event}")
-
+        print(src_names)
+        
         cal_files = find_files(
             event_id, data_type="visibilities", source_type="calibrator",version=version,filename_suffix=cal_name+'*'+tag
         )
@@ -180,49 +201,118 @@ if __name__=='__main__':
         )        
         print(target_files)
         
-        if len(cal_files)>0 and len(target_files)>0:
+        if False:#len(cal_files)>0 and len(target_files)>0:
             logging.info(f"##############################################")
             logging.info(f"{event_id} has already been processed!")
             logging.info(f"##############################################")
-
-        else:
-            telescopes=['kko','chime']
+        proceed=True
+        try:
+            #telescopes=[kko,chime]
+            tel_names=['kko','chime']
             logging.info(f'EVENT INFORMATION: {event_id}, {src_name}')
-            for telescope in telescopes:
-                data_pulled=False
+            
+            data_pulled_tels=[]
+            raw_data_dirs=[]
+            for telescope in tel_names:
+                data_pulled_tel=False
                 data_exists,raw_data_dir=baseband_exists(event_id, telescope)
                 if data_exists==False:
                     datatrail_pull_or_clear(event_id, telescope=telescope, cmd_str='PULLED')
-                    data_pulled=True
+                    data_pulled_tel=True
                     data_exists,raw_data_dir=baseband_exists(event_id, telescope)
-                if data_exists==True:
-                    logging.info(f'Baseband data for {telescope} found on /arc. Moving on to beamforming stage...')
-                    ### BEAMFORM ###
-                    cal_h5 = get_calfiles(day=day,month=month,year=year,telescope=telescope, ctime=ctime)
+                assert data_exists==True, f"data for telescope {telescope} not found"
+                logging.info(f'Baseband data for {telescope} found on /arc. Moving on to beamforming stage...')
+                ### BEAMFORM ###
+                data_pulled_tels.append(data_pulled_tel)
+                raw_data_dirs.append(raw_data_dir)
+        except:
+            logging.info(f"{event_id} FAILED TO PROCESS")
+            proceed=False
+        if proceed:
+            for m in range(len(tel_names)):
+                telescope=tel_names[m]
+                data_pulled=data_pulled_tels[m]
+                raw_data_dir=raw_data_dirs[m]
+                
+                cal_h5 = get_calfiles(day=day,month=month,year=year,telescope=telescope, ctime=ctime)
+                if telescope=='kko':
+                    if day<10:
+                        day_str='0'+str(day)
+                    else:
+                        day_str=str(day)
+                    if month<10:
+                        month_str='0'+str(month)
+                    else:
+                        month_str=str(month)
 
-                    clean_and_form_singlebeams(
-                        event_id=event_id,
-                        ras=ras, #array of floats
-                        decs=decs, #array of floats
-                        src_names=src_names, #array of strings
-                        telescope=telescope,
-                        raw_data_dir=raw_data_dir,
-                        cal_h5=cal_h5,
-                        ctime=ctime,
-                        version=version,
-                        events_database=database,
-                        source_types=['target','calibrator'],
-                        tag=tag,
-                        clean=clean,
-                    )
+                    if interpolate:
+                        cal_h5=glob.glob(f'/arc/home/shiona/kko_interpolated_gains/gain_{year}{month_str}{day_str}*.h5')[0]
+                        print("USING INTERPOLATED GAINS")
+                    else:
+                        print("WILL NOT USE INTERPOLATED GAINS")
+                print("STARTING BEAMFORMING")
+                out_files=clean_and_form_singlebeams(
+                    event_id=event_id,
+                    ras=ras, #array of floats
+                    decs=decs, #array of floats
+                    src_names=src_names, #array of strings
+                    telescope=telescope,
+                    raw_data_dir=raw_data_dir,
+                    cal_h5=cal_h5,
+                    ctime=ctime,
+                    version=version,
+                    events_database=database,
+                    source_types=['target','calibrator'],
+                    tag=tag,
+                    clean=clean,
+                )
+                if telescope=='chime':
+                    chime_target_singlebeam=out_files[0]
+                    chime_cal_singlebeam=out_files[1]
+                if telescope=='kko':
+                    kko_target_singlebeam=out_files[0]
+                    kko_cal_singlebeam=out_files[1]
 
-                    if data_pulled:
-                        datatrail_pull_or_clear(event_id, telescope=telescope, cmd_str='CLEARED')
+                if data_pulled:
+                    datatrail_pull_or_clear(event_id, telescope=telescope, cmd_str='CLEARED')
 
-                else:
-                    logging.error(f'Baseband data for {telescope} NOT found!')
-                    #update_event_status(event_id,'error',f'Baseband data for {telescope} NOT found!',events_database=database)
 
-                target_files=find_files(event_id=event_id,data_type="singlebeams",telescope='*',source_type='target',filename_suffix=telescope+'*'+tag)
-                if len(target_files)<1:
-                    logging.error(f'Unable to correlate data for event id {event_id}!')
+            diagnostics_out_dir=get_full_filepath(event_id=event_id, data_type="diagnostics",events_database=kko_events_database)
+            
+            ## target first ##
+            source_type='target'
+            get_pulse_lims=True
+            tel_singlebeams=[chime_target_singlebeam,kko_target_singlebeam]
+            logging.info(f"Using {tel_singlebeams}")
+            vis_target=re_correlate_target(
+                event_id,DM=DM,source_type=source_type,telescopes=[chime,kko],
+                tel_singlebeams=tel_singlebeams,get_pulse_lims=get_pulse_lims,
+                diagnostics_out_dir=diagnostics_out_dir)
+
+            vis_dir = get_full_filepath(event_id=event_id, data_type="visibilities",source_type=source_type,events_database=kko_events_database)
+            source_name=vis_target['index_map']['pointing_center']['source_name'][0].astype(str)
+            vis_out_file_target = f"{vis_dir}{event_id}_{source_name}_{tag}_vis.h5"
+            os.makedirs(os.path.dirname(vis_out_file_target), exist_ok=True, mode=0o777)
+            logging.info(f"Saving visibilities to {vis_out_file_target}")
+            vis_target.save(vis_out_file_target)
+            
+            
+            ## cal second ##
+            source_type='calibrator'
+            get_pulse_lims=False
+            tel_singlebeams=[chime_cal_singlebeam,kko_cal_singlebeam]
+            logging.info(f"Using {tel_singlebeams}")
+            vis_target=re_correlate_target(
+                event_id,DM=0,source_type=source_type,telescopes=[chime,kko],
+                tel_singlebeams=tel_singlebeams,get_pulse_lims=get_pulse_lims,
+                diagnostics_out_dir=diagnostics_out_dir)
+
+            vis_dir = get_full_filepath(event_id=event_id, data_type="visibilities",source_type=source_type,events_database=kko_events_database)
+            source_name=vis_target['index_map']['pointing_center']['source_name'][0].astype(str)
+            vis_out_file_target = f"{vis_dir}{event_id}_{source_name}_{tag}_vis.h5"
+            os.makedirs(os.path.dirname(vis_out_file_target), exist_ok=True, mode=0o777)
+            logging.info(f"Saving visibilities to {vis_out_file_target}")
+            vis_target.save(vis_out_file_target)
+ 
+            
+            

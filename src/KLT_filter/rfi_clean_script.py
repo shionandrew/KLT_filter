@@ -3,7 +3,7 @@ import sys
 import numpy as np
 from glob import glob
 
-from rfi_shion_version import clean_persistent_rfi
+from KLT_filter.rfi_shion_version import clean_persistent_rfi
 
 import baseband_analysis.core.calibration as cal
 
