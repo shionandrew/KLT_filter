@@ -19,6 +19,7 @@ from KLT_filter.injections.simulate_signal import fringestop_delays_vectorized
 import ch_util
 from beam_model.utils import get_equatorial_from_position, get_position_from_equatorial
 import copy
+from scipy.linalg import cho_factor, cho_solve
 
 def clean_persistent_rfi(
     data,
@@ -209,40 +210,57 @@ def clean_single_channel(
     # Find where NaNs at the end of the timestream are. Same for all inputs
 
 
-    try:
-        if clean:
-            print("STARTING CLEANING")
-            for pp in range(2):
-                # Construct filter
-                # The filter matrix has the form np.dot(a, b.T)
-                
-                good_inputs_index_pp=good_inputs_index[pp]
-                baseband_data=copy.deepcopy(data.baseband[rfi_ind][good_inputs_index_pp]) #ninputs, ntime
+    if clean:
+        print("STARTING KLT FILTER CLEANING")
+        for pp in range(2):
+            # Construct filter
+            # The filter matrix has the form np.dot(a, b.T)
+            
+            good_inputs_index_pp=good_inputs_index[pp]
+            baseband_data=copy.deepcopy(data.baseband[rfi_ind][good_inputs_index_pp]) #ninputs, ntime
+            print(baseband_data.shape)
+            baseband_data=np.concatenate((baseband_data[...,:frame_start],baseband_data[...,frame_stop:]),axis=-1) #remove signal when constructing visibility matrix
+            print(baseband_data.shape)
+            baseband_data=baseband_data[:,~np.isnan(baseband_data)[-1]] #remove nans
+            NN=len(baseband_data)
+            vis=(mat2utvec(np.tensordot(baseband_data,
+                                        baseband_data.conj(),
+                                        axes=([-1], [-1]))) / NN)
+            
+            s_i=np.array([fringestop_phase[i] for i in good_inputs_index[pp]])
+            fs_phase=mat2utvec(np.conj(s_i[np.newaxis, :])*(
+                        s_i[:, np.newaxis]))
+            S = utvec2mat(N_good_inputs[pp], fs_phase.conj())
+            F = utvec2mat(N_good_inputs[pp], vis) #should signal be extracted first?
+            c, low = cho_factor(F)
+            v = np.conj(cho_solve((c, low), S))[:,-1]
+            # fix phase, <v s^*>=real
+            z=np.sum(v*np.conj(s_i),axis=0) 
+            v/=z
+            # fix amplitude, <(v s^*)^2>=<(s s^*)**2>
+            v_dot_s=np.sum(np.abs(v*np.conj(s_i))**2,axis=0)
+            s_dot_s=np.sum(np.abs(s_i*np.conj(s_i))**2,axis=0)
+            norm_factor=s_dot_s/v_dot_s
+            v*=np.sqrt(norm_factor)
 
-                baseband_data=baseband_data[...,frame_stop:] #remove signal when constructing visibility matrix
+            data['tiedbeam_baseband'][rfi_ind, pp, :]=np.sum(v[:,np.newaxis] * data["baseband"][rfi_ind, good_inputs_index[pp]],axis=0)
 
-                baseband_data=baseband_data[:,~np.isnan(baseband_data)[-1]] #remove nans
-                NN=len(baseband_data)
-                vis=(mat2utvec(np.tensordot(baseband_data,
-                                            baseband_data.conj(),
-                                            axes=([-1], [-1]))) / NN)
+            '''fringestop_phasepp=np.array([fringestop_phase[i] for i in good_inputs_index[pp]])
+            fs_phase=mat2utvec(np.conj(fringestop_phasepp[np.newaxis, :])*(
+                        fringestop_phasepp[:, np.newaxis]))
+            S = utvec2mat(N_good_inputs[pp], fs_phase.conj())
+            F = utvec2mat(N_good_inputs[pp], vis) #should signal be extracted first?
+            evalues, R = la.eigh(S, F) #largest eval is last element
+            R_dagger = R.T.conj()
+            R_dagger_inv = la.inv(R_dagger)
+            a=R_dagger_inv[:, -1] #last 
+            b=R_dagger[-1] #last row
+            data["baseband"][rfi_ind, good_inputs_index[pp]] = a[:, np.newaxis] * np.sum(
+                b[:, np.newaxis] * data["baseband"][rfi_ind, good_inputs_index[pp]],
+                axis=0)[np.newaxis, :] #b=R
+            print(f"successfully cleaned pol hand {pp} for channel index {rfi_ind}")'''
 
-                fringestop_phasepp=np.array([fringestop_phase[i] for i in good_inputs_index[pp]])
-                fs_phase=mat2utvec(np.conj(fringestop_phasepp[np.newaxis, :])*(
-                            fringestop_phasepp[:, np.newaxis]))
-                S = utvec2mat(N_good_inputs[pp], fs_phase.conj())
-                F = utvec2mat(N_good_inputs[pp], vis) #should signal be extracted first?
-                evalues, R = la.eigh(S, F) #largest eval is last element
-                R_dagger = R.T.conj()
-                R_dagger_inv = la.inv(R_dagger)
-                a=R_dagger_inv[:, -1] #last 
-                b=R_dagger[-1] #last row
-
-                data["baseband"][rfi_ind, good_inputs_index[pp]] = a[:, np.newaxis] * np.sum(
-                    b[:, np.newaxis] * data["baseband"][rfi_ind, good_inputs_index[pp]],
-                    axis=0)[np.newaxis, :] #b=R
-                print(f"successfully cleaned pol hand {pp} for channel index {rfi_ind}")
-
+    else:
         for pp in range(2):
             # now we fringestop after cleaning
             fringestop_phase_pp=np.array([fringestop_phase[i] for i in good_inputs_index[pp]]) #ninputs 
@@ -250,16 +268,8 @@ def clean_single_channel(
             #fringedstop_baseband = fringestop_phase_pp[:,np.newaxis]*baseband_data_pp
             #data['tiedbeam_baseband'][rfi_ind, pp, :]= np.sum(fringedstop_baseband,axis=0)
             data['tiedbeam_baseband'][rfi_ind, pp, :]= fringestop_phase_pp @ baseband_data_pp
-        print(f"successfully beamformed index {rfi_ind}")
+    print(f"successfully beamformed index {rfi_ind}")
 
-
-    except np.linalg.LinAlgError as err:
-        time=datetime.datetime.now()
-        print(
-        "{0}: The following LinAlgError ocurred while constructing the RFI filter: {1}".format(
-            time.strftime("%Y%m%dT%H%M%S"), err))
-       
-        print("will nullify data (simulated)") #do not form beamformed data for now
 
 
 def mat2utvec(A):
