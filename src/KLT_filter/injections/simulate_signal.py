@@ -1,15 +1,5 @@
-from outriggers_vlbi_pipeline.multibeamform import beamform_multipointings, beamform_calibrators,rebeamform_singlebeam
-from outriggers_vlbi_pipeline.vlbi_pipeline_config import kko_backend, chime_backend,frb_events_database,kko_events_database
-from outriggers_vlbi_pipeline.query_database import get_event_data,find_files,get_calibrator_dataframe
-from outriggers_vlbi_pipeline.cross_correlate_data import correlate_multibeam_data
-from outriggers_vlbi_pipeline.query_database import check_correlation_completion, update_event_status,check_baseband_localization_completion
-from outriggers_vlbi_pipeline.calibration import update_calibrator_list
-from dtcli.src import functions
-from dtcli.utilities import cadcclient
 from ch_util import tools
 import numpy as np
-from outriggers_vlbi_pipeline.multibeamform import get_calfiles
-from outriggers_vlbi_pipeline.query_database import update_event_status,get_event_data, get_full_filepath, find_files,fetch_data_from_sheet,check_correlation_completion,get_target_vis_files,get_cal_vis_files
 from baseband_analysis.core.sampling import fill_waterfall
 import ch_util
 import scipy
@@ -31,24 +21,9 @@ import sys
 import re
 from pathlib import Path
 import time
-from outriggers_vlbi_pipeline.query_database import get_full_filepath, get_cal_vis_files
-from outriggers_vlbi_pipeline.known_calibrators import get_true_pulsar_pos
-from outriggers_vlbi_pipeline.geometry import angular_distance
-from outriggers_vlbi_pipeline.arc_commands import datatrail_pull_or_clear,datatrail_pull_cmd,datatrail_clear_cmd,baseband_exists,delete_baseband,vchmod,delete_multibeam,data_exists_at_minoc,datatrail_pull,datatrail_clear
 import logging
-from outriggers_vlbi_pipeline.vlbi_pipeline_config import (
-    chime,
-    kko,
-    gbo,
-    current_version,
-    kko_events_database,
-)
-from outriggers_vlbi_pipeline.vlbi_pipeline_config import calibrator_catalogue, calibrator_database, current_calibrators,current_version,known_pulsars
-from outriggers_vlbi_pipeline.cross_correlate_data import re_correlate_target
 from pycalc11 import Calc
-
-from outriggers_vlbi_pipeline.calibration import get_calibrator_visibilities, make_calibrated_visibilities
-from pyfx.core_correlation_station import get_delays, frac_samp_shift,getitem_zp1d,get_start_times
+from pyfx.core_correlation_station import get_delays
 import astropy.coordinates as ac
 from astropy.time import Time, TimeDelta
 
@@ -100,8 +75,8 @@ def get_pol_indices(data,inputs):
         except Exception as e:
             pols.append('')
     pols=np.array(pols)#[i.pol for i in reordered_inputs])
-    x=np.where(pols=='E')[0]
-    y=np.where(pols=='S')[0]
+    x=np.where(pols=="S")[0]
+    y=np.where(pols=="E")[0]
     return x,y
 
 
@@ -110,15 +85,16 @@ def inject_signal_into_baseband(
     signal, #2d array
     corr_inputs,
     delays,
-    s_t_n,
     frame_start,
     frame_stop,
     tec=0,
+    geo_delay=0,
     sample_rate=2.56,#microseconds
     inter_channel_sign=-1, #since baseband data is conjugated w.r.t. sky
     ):
     freqs=tel_bbdata.freq
     delayed_signals=[]
+    #un_delayed_signals=[]
     for pp in range(2):
         delayed_signal=generate_time_shifted_signal(
             signal=signal[pp],
@@ -130,31 +106,53 @@ def inject_signal_into_baseband(
         # add ionospheric delay
         k_dm = 1344.54095924  # Mhz/Tecu
         ionophase = k_dm*tec/freqs
-        P = np.exp(2j * np.pi * (ionophase))  # nfreq
+        geophase=geo_delay*freqs
+        P = np.exp(2j * np.pi * (ionophase+geophase))  # nfreq
         delayed_signal*=P[:,np.newaxis,np.newaxis]
-
         delayed_signals.append(delayed_signal)
-    
 
+        '''un_delayed_signal=generate_time_shifted_signal(
+            signal=signal[pp],
+            delays=0*delays,
+            freqs=freqs,
+            sample_rate=sample_rate,
+            inter_channel_sign=inter_channel_sign
+        )'''
+
+        #un_delayed_signals.append(un_delayed_signal)
+    #un_delayed_signals=np.array(un_delayed_signals)
+    delayed_signals=np.array(delayed_signals)
+    noises=np.zeros(delayed_signals.shape,delayed_signals.dtype)
     for freq_index in range(len(freqs)):
         x_inputs,y_inputs=get_pol_indices(data=tel_bbdata,inputs=corr_inputs)
         inputs=[x_inputs,y_inputs]
         for pp in range(len(inputs)):
             input_indices=inputs[pp]
             delayed_signal_stn=delayed_signals[pp][freq_index][input_indices]#ninputs, ntime
-            #noise=np.nanstd(np.nansum(np.abs(tel_bbdata['baseband'][freq_index,input_indices])**2,axis=0)[frame_start:frame_stop],axis=-1) #shape ntime, std over ntime after summing inputs 
-            #delayed_signal_stn=delayed_signal_stn*np.sqrt(noise)*s_t_n  #amplitude of signal determined by s_t_n
+            ### REMOVE ####
+            '''NOISE=100
+            noise=np.random.normal(0,NOISE*np.mean(np.abs(delayed_signal_stn)),delayed_signal_stn.shape)
+            noise_c=1j*(np.random.normal(0,NOISE*np.mean(np.abs(delayed_signal_stn)),delayed_signal_stn.shape)).astype(complex)#[good_inputs_index[pp]]
+            noises[pp,freq_index,input_indices]=noise+noise_c
+            delayed_signal_stn+=noise+noise_c
+            tel_bbdata['baseband'][freq_index][input_indices]=0'''
+            ### REMOVE ####
+
             bbdata_ntime=tel_bbdata['baseband'][freq_index].shape[-1]
             sig_ntime=delayed_signal_stn.shape[-1]
             if bbdata_ntime<sig_ntime:
                 tel_bbdata['baseband'][freq_index][input_indices]+=delayed_signal_stn[:,:bbdata_ntime]
-
+                tel_bbdata['input_signal'][freq_index][input_indices]+=delayed_signal_stn[:,:bbdata_ntime]
             elif bbdata_ntime>sig_ntime:
                 tel_bbdata['baseband'][freq_index][input_indices][:,:sig_ntime]+=delayed_signal_stn
+                tel_bbdata['input_signal'][freq_index][input_indices][:,:sig_ntime]+=delayed_signal_stn
 
             else:
                 tel_bbdata['baseband'][freq_index][input_indices]+=delayed_signal_stn
+                tel_bbdata['input_signal'][freq_index][input_indices]+=delayed_signal_stn
         tel_bbdata.attrs['tec']=tec
+        tel_bbdata.attrs['geo_delay']=geo_delay
+    return delayed_signals,noises
 
 
 

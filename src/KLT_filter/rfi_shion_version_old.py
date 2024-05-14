@@ -12,21 +12,31 @@ import scipy.linalg as la
 import scipy.constants
 import baseband_analysis.core as bbcore
 from ch_util import ephemeris, tools
-from typing import List
+from typing import List, Optional
 import baseband_analysis.core.calibration as cal
 from baseband_analysis.analysis.beamform import fringestop_time_vectorized
+from KLT_filter.injections.simulate_signal import fringestop_delays_vectorized
+import ch_util
+from beam_model.utils import get_equatorial_from_position, get_position_from_equatorial
+import copy
 
 def clean_persistent_rfi(
     data,
     ra:np.ndarray, 
     dec:np.ndarray, 
+    source_names:np.ndarray,
     ps_gain_file:str, 
     inputs:List,
     static_delays:bool,
+    clean:bool,
+    fringestop_delays:Optional[np.ndarray]=None, #freq indep
+    frame_start=None,
+    frame_stop=None,
     reference_feed=tools.CHIMEAntenna(
         id=-1, slot=-1, powered=True, flag=True, pos=[0, 0, 0]
     ),
-    obs=ephemeris.chime):
+    obs=ephemeris.chime,
+    ):
     """
     Clean baseband data from persistent RFI
     
@@ -43,12 +53,7 @@ def clean_persistent_rfi(
     """
 
     # baseband data info
-    timestamp0 = data["time0"]["ctime"] + data["time0"]["ctime_offset"]
-    date0 = [datetime.datetime.utcfromtimestamp(t) for t in timestamp0]
-    timestamp = timestamp0[:, np.newaxis] + data.time[np.newaxis, :]
-    N_times = len(timestamp[0])
-    f_MHz = data.freq
-    N_freqs = len(f_MHz)
+    N_freqs = len(data.freq)
 
     # Get gains (nfreq,ninputs) (ordered to bbdata)
     freq_id_list = data.index_map["freq"]["id"]
@@ -69,25 +74,78 @@ def clean_persistent_rfi(
     reordered_inputs.append(reference_feed)
     prod_map["input_b"] = len(data.input)
 
-    print("STARTING CLEANING")
+    nfreq=data.baseband.shape[0]
+    npointing=1
+    npol=2
+    ntime=data.baseband.shape[-1]
+    tiedbeam_baseband = data.create_dataset(
+        "tiedbeam_baseband", shape=(nfreq, npointing*npol, ntime), dtype=data.baseband.dtype
+    )
+
+    true_tiedbeam_baseband = data.create_dataset(
+        "true_tiedbeam_baseband", shape=(nfreq, npointing*npol, ntime), dtype=data.baseband.dtype
+    )
+
+    from caput import memh5
+    memh5.copyattrs(data["baseband"].attrs, tiedbeam_baseband.attrs)
+    memh5.copyattrs(data["baseband"].attrs, true_tiedbeam_baseband.attrs)
+    tiedbeam_baseband.attrs["axis"] = ["freq", "beam", "time"]
+    true_tiedbeam_baseband.attrs["axis"] = ["freq", "beam", "time"]
+    tiedbeam_baseband.attrs["conjugate_beamform"] = int(1)
+
+
     for rfi_ind in range(N_freqs):
         try:
             clean_single_channel(
             data=data,
             ra=ra,
             dec=dec,
-            obs=obs,gain_reordered=gain_reordered,
+            obs=obs,
+            gain_reordered=gain_reordered,
+            fringestop_delays=fringestop_delays,
             rfi_ind=rfi_ind,
             prod_map=prod_map,
             reordered_inputs=reordered_inputs,
-            static_delays=static_delays
+            static_delays=static_delays,
+            clean=clean,
+            frame_start=frame_start,
+            frame_stop=frame_stop
         )
-            print(f"successfully cleaned channel {data.freq[rfi_ind]}")
+            print(f"completely finished with channel {data.freq[rfi_ind]}")
 
         except Exception as e:
             print(f"WARNING: COULD NOT PROCESS CHANNEL {data.freq[rfi_ind]} due to error: {e}")
 
     print("%s: RFI cleaning finished" %(time.strftime("%Y%m%dT%H%M%S")))
+    
+    del data['baseband']
+    del data['input_signal']
+    ib_dtype = [
+        ("ra", float),
+        ("dec", float),
+        ("x_400MHz", float),
+        ("y_400MHz", float),
+        ("pol", "S1"),
+    ]
+    ra, dec = (
+        np.asarray(ra, dtype=float).reshape(-1),
+        np.asarray(dec, dtype=float).reshape(-1),
+    )
+    if source_names is not None:
+        ib_dtype.append(("source_name", "<S50"))
+    ib = np.empty(npointing*npol, dtype=ib_dtype)
+    ib["ra"] = ra#(ra[:, None] * np.ones(2, dtype=ra.dtype)).flat
+    ib["dec"] = dec#(dec[:, None] * np.ones(2, dtype=dec.dtype)).flat
+    ctime = data["time0"]["ctime"][-1] + data["time0"]["ctime_offset"][-1]
+    ctime = ctime + np.mean(data.index_map["time"]["offset_s"])
+    x, y = get_position_from_equatorial(ra, dec, ctime, telescope_rotation_angle=None)
+    ib["x_400MHz"] = x#(x[:, None] * np.ones(2, dtype=x.dtype)).flat
+    ib["y_400MHz"] = y#(y[:, None] * np.ones(2, dtype=y.dtype)).flat
+    ib["pol"] = ["S", "E"] * npointing
+    if source_names is not None:
+        ib["source_name"] = [y for x in source_names for y in (x,) * 2]
+    loc = data.create_dataset("tiedbeam_locations", data=ib)
+    loc.attrs["axis"] = ["beam"]
 
     return
 
@@ -100,87 +158,120 @@ def clean_single_channel(
     gain_reordered,
     prod_map,
     static_delays,
-    reordered_inputs:List
+    reordered_inputs:List,
+    clean:bool,
+    fringestop_delays:Optional[np.ndarray]=None,
+    frame_start=None,
+    frame_stop=None,
 ):
+    if frame_start is None:
+        frame_start=0
+    if frame_stop is None:
+        frame_stop=0
+    
 
-    time = (
-            data["time0"]["ctime"][rfi_ind] + data["time0"]["ctime_offset"][rfi_ind]
-        )
-    time = time + data.index_map["time"]["offset_s"][rfi_ind]
-    ra_from_src = np.empty(ra.shape[0])
-    dec_from_src = np.empty(dec.shape[0])
-    for iipoint in range(len(ra)):
-        src = ephemeris.skyfield_star_from_ra_dec(ra[iipoint], dec[iipoint])
-        (
-            ra_from_src[iipoint],
-            dec_from_src[iipoint],
-        ) = ephemeris.object_coords(src, time, obs=obs)
 
     # Get list of bad inputs from  gains
-    assert np.nanmax(np.abs(gain_reordered[rfi_ind].flatten()))>0, "gains appear to have zeroed out rfi channels!"
+    assert np.nanmax(np.abs(gain_reordered[rfi_ind].flatten()))>0, "all inputs have a gain of 0.0; gains appear to have zeroed out for this channel!"
     good_inputs_index = np.where(abs(gain_reordered[rfi_ind])>0.)[0]
     good_inputs_index_x = np.array([good_inputs_index[ii] for ii in
                                     range(len(good_inputs_index)) if
-                                    reordered_inputs[good_inputs_index[ii]].pol=="E"])
+                                    reordered_inputs[good_inputs_index[ii]].pol=="S"])
     good_inputs_index_y = np.array([good_inputs_index[ii] for ii in
                                     range(len(good_inputs_index)) if
-                                    reordered_inputs[good_inputs_index[ii]].pol=="S"])
+                                    reordered_inputs[good_inputs_index[ii]].pol=="E"])
     good_inputs_index = [good_inputs_index_x, good_inputs_index_y]
     N_good_inputs = [len(good_inputs_index[pp]) for pp in range(2)]
-        
-    fringestop_phase = fringestop_time_vectorized(
-        time,
-        data.freq[rfi_ind],
-        reordered_inputs,
-        ra_from_src,
-        dec_from_src,
-        prod_map=prod_map,
-        obs=obs,
-        static_delays=static_delays,
-    ).T.astype(np.complex64)[0]
+    if fringestop_delays is None:
+        time = (
+        data["time0"]["ctime"][rfi_ind] + data["time0"]["ctime_offset"][rfi_ind]
+        )
+        time = time + np.mean(data.index_map["time"]["offset_s"])
+
+        ra_from_src = np.empty(ra.shape[0])
+        dec_from_src = np.empty(dec.shape[0])
+        for iipoint in range(len(ra)):
+            src = ephemeris.skyfield_star_from_ra_dec(ra[iipoint], dec[iipoint])
+            (
+                ra_from_src[iipoint],
+                dec_from_src[iipoint],
+            ) = ephemeris.object_coords(src, time, obs=obs)
+        fringestop_phase = fringestop_time_vectorized(
+            time,
+            data.freq[rfi_ind],
+            reordered_inputs,
+            ra_from_src,
+            dec_from_src,
+            prod_map=prod_map,
+            obs=obs,
+            static_delays=static_delays,
+        ).T.astype(np.complex64)[0]
+    else:
+        fringestop_phase=np.exp(2j*np.pi*data.freq[rfi_ind]*fringestop_delays) #(ninputs)
+
 
     ###########################################################################
     ############################ form visibilities ############################
     ###########################################################################
     # Find where NaNs at the end of the timestream are. Same for all inputs
-    vis=[]
-    for pp in range(2):
-        good_inputs_index_pp=good_inputs_index[pp]
-        baseband_data=data.baseband[rfi_ind][good_inputs_index_pp] #ninputs, ntime
-        baseband_data=baseband_data[:,~np.isnan(baseband_data)[-1]] #remove nans
-        NN=len(baseband_data)
-        vis.append(mat2utvec(np.tensordot(baseband_data,
-                                    baseband_data.conj(),
-                                    axes=([-1], [-1]))) / NN)
 
-    # Construct filter
-    # The filter matrix has the form np.dot(a, b.T)
-    a = []
-    b = []
 
     try:
-        for pp in range(2):
-            fringestop_phasepp=np.array([fringestop_phase[i] for i in good_inputs_index[pp]])
-            fs_phase=mat2utvec(np.conj(fringestop_phasepp[np.newaxis, :])*(
-                        fringestop_phasepp[:, np.newaxis]))
-            S = utvec2mat(N_good_inputs[pp], fs_phase.conj())
-            F = utvec2mat(N_good_inputs[pp], vis[pp]) #should signal be extracted first?
-            evalues, R = la.eigh(S, F) #largest eval is last element
-            R_dagger = R.T.conj()
-            R_dagger_inv = la.inv(R_dagger)
-            a.append(R_dagger_inv[:, -1]) #last 
-            b.append(R_dagger[-1]) #last row
+        if clean:
+            print("STARTING CLEANING")
+            for pp in range(2):
+                # Construct filter
+                # The filter matrix has the form np.dot(a, b.T)
+                
+                good_inputs_index_pp=good_inputs_index[pp]
+                baseband_data=copy.deepcopy(data.baseband[rfi_ind][good_inputs_index_pp]) #ninputs, ntime
+
+                baseband_data=baseband_data[...,frame_stop:] #remove signal when constructing visibility matrix
+
+                baseband_data=baseband_data[:,~np.isnan(baseband_data)[-1]] #remove nans
+                NN=len(baseband_data)
+                vis=(mat2utvec(np.tensordot(baseband_data,
+                                            baseband_data.conj(),
+                                            axes=([-1], [-1]))) / NN)
+
+                fringestop_phasepp=np.array([fringestop_phase[i] for i in good_inputs_index[pp]])
+                fs_phase=mat2utvec(np.conj(fringestop_phasepp[np.newaxis, :])*(
+                            fringestop_phasepp[:, np.newaxis]))
+                S = utvec2mat(N_good_inputs[pp], fs_phase.conj())
+                F = utvec2mat(N_good_inputs[pp], vis) #should signal be extracted first?
+                evalues, R = la.eigh(S, F) #largest eval is last element
+                R_dagger = R.T.conj()
+                R_dagger_inv = la.inv(R_dagger)
+                a=R_dagger_inv[:, -1] #last 
+                b=R_dagger[-1] #last row
+
+                data["baseband"][rfi_ind, good_inputs_index[pp]] = a[:, np.newaxis] * np.sum(
+                    b[:, np.newaxis] * data["baseband"][rfi_ind, good_inputs_index[pp]],
+                    axis=0)[np.newaxis, :] #b=R
+                print(f"successfully cleaned pol hand {pp} for channel index {rfi_ind}")
 
         for pp in range(2):
-            data["baseband"][rfi_ind, good_inputs_index[pp]] = a[pp][:, np.newaxis] * np.sum(
-                b[pp][:, np.newaxis] * data["baseband"][rfi_ind, good_inputs_index[pp]],
-                axis=0)[np.newaxis, :] #b=R
+            # now we fringestop after cleaning
+            fringestop_phase_pp=np.array([fringestop_phase[i] for i in good_inputs_index[pp]]) #ninputs 
+            baseband_data_pp=copy.deepcopy(data["baseband"][rfi_ind, good_inputs_index[pp]]) #ninputs, ntime
+            #fringedstop_baseband = fringestop_phase_pp[:,np.newaxis]*baseband_data_pp
+            #data['tiedbeam_baseband'][rfi_ind, pp, :]= np.sum(fringedstop_baseband,axis=0)
+            data['tiedbeam_baseband'][rfi_ind, pp, :]= fringestop_phase_pp @ baseband_data_pp
+
+            true_baseband_data_pp=data["input_signal"][rfi_ind, good_inputs_index[pp]]
+            data['true_tiedbeam_baseband'][rfi_ind, pp, :]= fringestop_phase_pp @ true_baseband_data_pp
+
+        print(f"successfully beamformed index {rfi_ind}")
+
 
     except np.linalg.LinAlgError as err:
         time=datetime.datetime.now()
         print(
         "{0}: The following LinAlgError ocurred while constructing the RFI filter: {1}".format(
             time.strftime("%Y%m%dT%H%M%S"), err))
+       
+        print("will nullify data (simulated)") #do not form beamformed data for now
+
 
 def mat2utvec(A):
     """Vectorizes its upper triangle of the (hermitian) matrix A.
